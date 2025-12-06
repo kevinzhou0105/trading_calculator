@@ -1,24 +1,18 @@
 import streamlit as st
 
-import pandas as pd
-
-import numpy as np
-
 import requests
 
-import time
 
 
-
-# --- 页面配置 ---
+# --- 页面全局配置 ---
 
 st.set_page_config(
 
-    page_title="OKX Kelly Calculator",
+    page_title="动态仓位计算器",
 
-    page_icon="🟦",
+    page_icon="⚖️",
 
-    layout="centered"
+    layout="wide" # 开启宽屏模式，方便横向对比
 
 )
 
@@ -26,23 +20,13 @@ st.set_page_config(
 
 # --- 核心函数：获取 OKX 实时价格 ---
 
-# 使用 st.cache_data 防止每次点击按钮都疯狂请求 API，设置 ttl 为 5 秒过期
-
 @st.cache_data(ttl=5)
 
 def get_okx_price(symbol):
 
-    """
-
-    调用 OKX V5 Public API 获取永续合约价格
-
-    """
-
-    inst_id = f"{symbol.upper()}-USDT-SWAP" # 默认拼接为 USDT 永续
+    inst_id = f"{symbol.upper()}-USDT-SWAP"
 
     url = f"https://www.okx.com/api/v5/market/ticker?instId={inst_id}"
-
-    
 
     try:
 
@@ -54,159 +38,45 @@ def get_okx_price(symbol):
 
             return float(data['data'][0]['last'])
 
-        else:
+        return None
 
-            return None
-
-    except Exception as e:
+    except:
 
         return None
 
 
 
-# --- 侧边栏：参数设置 ---
+# --- 核心函数：凯利计算逻辑 ---
 
-st.sidebar.header("⚙️ 账户与风控")
+def calculate_kelly_position(balance, win_rate, rr_ratio, friction, kelly_fraction, entry_price, sl_price, leverage_input):
 
-balance = st.sidebar.number_input("账户可用余额 (USDT)", value=10000.0, step=100.0)
+    # 1. 判断方向与止损幅度
 
+    if sl_price < entry_price:
 
+        direction = "long"
 
-# 胜率与盈亏比
-
-col_s1, col_s2 = st.sidebar.columns(2)
-
-with col_s1:
-
-    win_rate = st.number_input("胜率 (%)", value=51.0, step=0.5) / 100
-
-with col_s2:
-
-    rr_ratio = st.number_input("盈亏比 (R:R)", value=1.5, step=0.1)
-
-
-
-# 凯利系数
-
-st.sidebar.markdown("---")
-
-kelly_fraction = st.sidebar.select_slider(
-
-    "凯利激进程度",
-
-    options=[0.1, 0.2, 0.25, 0.5, 1.0],
-
-    value=0.25,
-
-    format_func=lambda x: f"1/{int(1/x)} Kelly" if x < 1 else "Full Kelly"
-
-)
-
-friction = st.sidebar.number_input("预估磨损 (手续费+滑点 %)", value=0.1, step=0.01) / 100
-
-
-
-# --- 主界面 ---
-
-st.title("🟦 OKX 动态仓位计算器")
-
-st.caption("Connected to OKX V5 API (USDT-SWAP)")
-
-
-
-# 1. 币种与价格获取
-
-col_input, col_price = st.columns([1, 1])
-
-
-
-with col_input:
-
-    symbol = st.text_input("输入币种 (如 BTC, ETH, SOL)", value="ETH").upper()
-
-    refresh = st.button("🔄 刷新价格")
-
-
-
-# 获取价格逻辑
-
-current_price = get_okx_price(symbol)
-
-
-
-with col_price:
-
-    if current_price:
-
-        st.metric(label=f"{symbol}/USDT 永续现价", value=f"${current_price:,.2f}")
+        sl_pct = (entry_price - sl_price) / entry_price
 
     else:
 
-        st.error("无法获取价格，请检查网络或币种")
+        direction = "short"
 
-        # 如果API失败，允许手动输入
-
-        current_price = st.number_input("手动输入入场价", value=0.0)
-
-
-
-# 2. 止损设置 (核心交互优化)
-
-st.markdown("### 🛑 止损设置")
-
-st.info("不再需要计算百分比，直接输入你的**心理止损价**即可。")
-
-
-
-stop_loss_price = st.number_input(
-
-    f"设定 {symbol} 止损价格", 
-
-    value=current_price * 0.98 if current_price else 0.0, # 默认给个2%的距离
-
-    step=0.1,
-
-    format="%.2f"
-
-)
-
-
-
-# --- 核心计算逻辑 ---
-
-if current_price > 0 and stop_loss_price > 0:
-
-    # 自动计算止损百分比 (方向自动识别：做多或做空)
-
-    if stop_loss_price < current_price:
-
-        direction = "🟢 做多 (Long)"
-
-        sl_pct = (current_price - stop_loss_price) / current_price
-
-    else:
-
-        direction = "🔴 做空 (Short)"
-
-        sl_pct = (stop_loss_price - current_price) / current_price
+        sl_pct = (sl_price - entry_price) / entry_price
 
     
 
-    # 防止分母为0或止损太近
+    # 保护机制：防止止损太近导致除零
 
     if sl_pct < 0.001:
 
-        st.warning("止损距离太近，无法计算有效仓位。")
-
-        st.stop()
+        return None
 
 
 
-    # --- 凯利公式计算 (复用之前的逻辑) ---
+    # 2. 凯利公式
 
     real_rr = (rr_ratio - friction) / (1 + friction)
-
-    
 
     if real_rr <= 0:
 
@@ -216,72 +86,356 @@ if current_price > 0 and stop_loss_price > 0:
 
         raw_kelly = (real_rr * win_rate - (1 - win_rate)) / real_rr
 
-
+    
 
     risk_per_trade_pct = max(0, raw_kelly * kelly_fraction)
 
     
 
-    # 金额计算
+    # 3. 仓位计算
 
-    risk_amount = balance * risk_per_trade_pct # 愿意亏损金额
+    risk_amount = balance * risk_per_trade_pct # 愿意亏损的金额 (Risk)
 
-    position_size = risk_amount / sl_pct # 开仓名义价值
+    position_value = risk_amount / sl_pct # 名义持仓价值 (Notional Value)
 
-    qty_coin = position_size / current_price # 对应的币数量
-
-    leverage = position_size / balance # 实际杠杆
-
-
-
-    # --- 结果展示面板 ---
-
-    st.divider()
-
-    st.subheader(f"📊 计算结果: {direction}")
+    coin_qty = position_value / entry_price # 币的数量
 
     
 
-    # 关键大指标
+    # 4. 保证金计算 (基于用户输入的杠杆)
+
+    required_margin = position_value / leverage_input
+
+    
+
+    # 5. 实际有效杠杆 (Effective Leverage)
+
+    effective_leverage = position_value / balance
+
+
+
+    return {
+
+        "direction": direction,
+
+        "sl_pct": sl_pct,
+
+        "risk_amount": risk_amount,
+
+        "position_value": position_value,
+
+        "coin_qty": coin_qty,
+
+        "required_margin": required_margin,
+
+        "effective_leverage": effective_leverage,
+
+        "raw_kelly": raw_kelly
+
+    }
+
+
+
+# ==========================================
+
+# UI 布局开始
+
+# ==========================================
+
+
+
+st.title("⚖️ 动态仓位计算器")
+
+st.markdown("Connected to **OKX V5 API** (USDT-SWAP)")
+
+
+
+# --- 模块 1：账户与风控 (移至主屏幕顶部) ---
+
+with st.container(border=True):
+
+    st.subheader("🛠️ 账户与风控参数")
+
+    
+
+    # 第一行：资金与杠杆
 
     c1, c2, c3 = st.columns(3)
 
-    c1.metric("建议开仓数量", f"{qty_coin:.3f} {symbol}")
+    with c1:
 
-    c2.metric("开仓总价值 (USDT)", f"${position_size:,.0f}")
+        balance = st.number_input("账户可用余额 (USDT)", value=10000.0, step=100.0)
 
-    c3.metric("实际杠杆倍数", f"{leverage:.2f}x", delta_color="inverse" if leverage > 5 else "normal")
+    with c2:
+
+        # 用户要求的自定义杠杆输入
+
+        user_leverage = st.number_input(
+
+            "开单杠杆倍数 (Leverage)", 
+
+            min_value=0.1, 
+
+            max_value=20.0, 
+
+            value=5.0, 
+
+            step=0.1, 
+
+            format="%.2f",
+
+            help="你将在交易所实际调节的杠杆倍数"
+
+        )
+
+    with c3:
+
+        # 凯利激进程度
+
+        kelly_fraction = st.select_slider(
+
+            "凯利激进程度 (Kelly Fraction)",
+
+            options=[0.1, 0.2, 0.25, 0.5, 1.0],
+
+            value=0.25,
+
+            format_func=lambda x: f"1/{int(1/x)} Kelly" if x < 1 else "Full Kelly"
+
+        )
 
 
 
-    # 详细风控数据
+    # 第二行：策略参数
 
-    with st.expander("查看风控详情 (Risk Details)", expanded=True):
+    c4, c5, c6 = st.columns(3)
 
-        st.write(f"**止损幅度:** {sl_pct*100:.2f}% (距离 ${abs(current_price-stop_loss_price):.2f})")
+    with c4:
 
-        st.write(f"**单笔最大亏损:** ${risk_amount:.2f} (账户的 {risk_per_trade_pct*100:.2f}%)")
+        win_rate = st.number_input("策略胜率 (%)", value=51.0, step=0.5) / 100
+
+    with c5:
+
+        rr_ratio = st.number_input("目标盈亏比 (R:R)", value=1.5, step=0.1)
+
+    with c6:
+
+        friction = st.number_input("预估磨损 (手续费+滑点 %)", value=0.1, step=0.01) / 100
+
+
+
+# --- 模块 2：行情获取 ---
+
+st.divider()
+
+col_ticker, col_price = st.columns([1, 3])
+
+with col_ticker:
+
+    symbol = st.text_input("交易币种", value="BTC", placeholder="BTC, ETH...").upper()
+
+    refresh = st.button("🔄 刷新行情", use_container_width=True)
+
+
+
+# 获取价格
+
+current_price = get_okx_price(symbol)
+
+if not current_price:
+
+    # 允许手动输入作为备用
+
+    with col_price:
+
+        current_price = st.number_input("无法获取行情，请手动输入价格", value=0.0)
+
+else:
+
+    with col_price:
+
+        st.metric(f"{symbol}/USDT 永续现价", f"${current_price:,.2f}")
+
+
+
+# --- 模块 3：双向推演 (核心修改) ---
+
+if current_price > 0:
+
+    st.markdown("### 🎯 交易计划推演")
+
+    
+
+    # 创建左右两列，分别对应 做多 和 做空
+
+    col_long, col_short = st.columns(2)
+
+
+
+    # ================= 🟢 左侧：做多逻辑 =================
+
+    with col_long:
+
+        st.info("🟢 **做多 (Long)** 场景")
 
         
 
-        if raw_kelly <= 0:
+        # 默认给一个合理的做多止损价 (现价下方2%)
 
-            st.error("根据凯利公式，当前胜率和盈亏比期望值为负，建议**空仓**！")
+        default_long_sl = float(current_price * 0.98)
 
-        elif leverage > 10:
+        sl_price_long = st.number_input(
 
-             st.error(f"⚠️ **极高风险**：计算杠杆超过 10倍。建议调低凯利系数或手动减少仓位。")
+            "设定做多止损价 (Stop Loss)", 
 
-        elif leverage > 5:
+            value=default_long_sl, 
 
-             st.warning(f"⚠️ **高风险**：杠杆超过 5倍，请注意防范插针风险。")
+            step=1.0, 
+
+            format="%.2f",
+
+            key="sl_long"
+
+        )
+
+
+
+        if sl_price_long >= current_price:
+
+            st.warning("⚠️ 做多止损价必须低于现价")
 
         else:
 
-            st.success("✅ **安全仓位**：风控合理。")
+            # 执行计算
+
+            res_long = calculate_kelly_position(
+
+                balance, win_rate, rr_ratio, friction, kelly_fraction, 
+
+                current_price, sl_price_long, user_leverage
+
+            )
+
+            
+
+            if res_long:
+
+                st.markdown("---")
+
+                # 结果展示
+
+                l1, l2 = st.columns(2)
+
+                l1.metric("建议开仓数量", f"{res_long['coin_qty']:.3f} {symbol}")
+
+                l2.metric("仓位总价值", f"${res_long['position_value']:,.0f}")
+
+                
+
+                st.caption(f"需要保证金: **${res_long['required_margin']:,.2f}** (基于 {user_leverage}x)")
+
+                
+
+                # 风控条
+
+                st.progress(min(res_long['sl_pct'] * 10, 1.0), text=f"止损幅度: {res_long['sl_pct']*100:.2f}%")
+
+                
+
+                # 风险警告
+
+                if res_long['raw_kelly'] <= 0:
+
+                    st.error("❌ 期望值为负，不建议开多")
+
+                elif res_long['effective_leverage'] > 5:
+
+                    st.error(f"⚠️ 实际杠杆过高 ({res_long['effective_leverage']:.2f}x)")
+
+
+
+    # ================= 🔴 右侧：做空逻辑 =================
+
+    with col_short:
+
+        st.error("🔴 **做空 (Short)** 场景")
+
+        
+
+        # 默认给一个合理的做空止损价 (现价上方2%)
+
+        default_short_sl = float(current_price * 1.02)
+
+        sl_price_short = st.number_input(
+
+            "设定做空止损价 (Stop Loss)", 
+
+            value=default_short_sl, 
+
+            step=1.0, 
+
+            format="%.2f",
+
+            key="sl_short"
+
+        )
+
+
+
+        if sl_price_short <= current_price:
+
+            st.warning("⚠️ 做空止损价必须高于现价")
+
+        else:
+
+            # 执行计算
+
+            res_short = calculate_kelly_position(
+
+                balance, win_rate, rr_ratio, friction, kelly_fraction, 
+
+                current_price, sl_price_short, user_leverage
+
+            )
+
+            
+
+            if res_short:
+
+                st.markdown("---")
+
+                # 结果展示
+
+                s1, s2 = st.columns(2)
+
+                s1.metric("建议开仓数量", f"{res_short['coin_qty']:.3f} {symbol}")
+
+                s2.metric("仓位总价值", f"${res_short['position_value']:,.0f}")
+
+                
+
+                st.caption(f"需要保证金: **${res_short['required_margin']:,.2f}** (基于 {user_leverage}x)")
+
+
+
+                # 风控条
+
+                st.progress(min(res_short['sl_pct'] * 10, 1.0), text=f"止损幅度: {res_short['sl_pct']*100:.2f}%")
+
+
+
+                # 风险警告
+
+                if res_short['raw_kelly'] <= 0:
+
+                    st.error("❌ 期望值为负，不建议开空")
+
+                elif res_short['effective_leverage'] > 5:
+
+                    st.error(f"⚠️ 实际杠杆过高 ({res_short['effective_leverage']:.2f}x)")
 
 
 
 else:
 
-    st.info("等待输入价格数据...")
+    st.info("👈 等待获取行情数据...")
